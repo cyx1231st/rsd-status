@@ -1,0 +1,4 @@
+Purpose
+=======
+
+Report RSD status.
