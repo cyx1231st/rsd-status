@@ -11,6 +11,9 @@ from sushy import exceptions as sushy_exceptions
 import print_utils as utils
 
 
+rsd_url = "http://http://10.1.0.99:30000"
+username = "admin"
+password = "admin"
 verify = False
 GIGABYTE = 1024*1024*1024
 
@@ -47,10 +50,19 @@ def init():
 #     node_inst = rsd.get_node(node)
 #     return node_inst
 
+def get_node_by_uuid(rsd, uuid):
+    uuid = uuid.upper()
+    nodes = rsd.get_node_collection().get_members()
+    for node in nodes:
+        if node and node.system\
+                and node.system.uuid\
+                and node.system.uuid.upper() == uuid:
+            return node
+    return None
+
 def get_nodes(rsd):
     node_col = rsd.get_node_collection()
     nodes = node_col.get_members()
-    nodes = [get_node(rsd, node.path) for node in nodes]
     return nodes
 
 def get_node(rsd, path):
@@ -86,8 +98,10 @@ def show_node(rsd, node):
         print("  !! %s" % o)
     print("allowed attach endp:")
     volumes = [url for url in node.get_allowed_attach_endpoints()]
-    volumes = [get_volume(rsd, url) for url in volumes]
-    show_volumes(rsd, volumes, 1)
+    for vol in volumes:
+        print("  %s" % vol)
+    # volumes = [get_volume(rsd, url) for url in volumes]
+    # show_volumes(rsd, volumes, 1)
     print("links:")
     links = node.links
     assert 6 == len(links.keys())
@@ -126,18 +140,29 @@ def show_node(rsd, node):
     utils.print_body_none(node, (
         "memory_summary",
         "processor_summary"))
-    system = get_system(rsd, node.system.path)
-    show_system(rsd, system)
+    if node.system:
+        system = get_system(rsd, node.system.path)
+        show_system(rsd, system)
 
 def show_nodes(rsd, nodes, level=0):
     for node in nodes:
         assert isinstance(node, rsd_lib.resources.v2_3.node.Node)
         links_ = node.json["Links"]
-        system = get_system(rsd, node.system.path)
-        processors = system.processors.get_members()
-        interfaces = system.ethernet_interfaces.get_members()
-        macs = ",".join(i.mac_address[-6:] for i in interfaces)
-        links = system.json["Links"]
+
+        try:
+            system = get_system(rsd, node.system.path)
+            processors = system.processors.get_members()
+            interfaces = system.ethernet_interfaces.get_members()
+            macs = ",".join(i.mac_address[-6:] for i in interfaces)
+            links = system.json["Links"]
+        except Exception as e:
+            system = None
+            links = None
+
+        try:
+            len_attach_endpoints = len(node.get_allowed_attach_endpoints())
+        except Exception as e:
+            len_attach_endpoints = 0
 
         print("%s%s \"%s\": %s %s; "
               "dv(l/r) %s/%s; eps %s/%s/%s; mgrs %s/%s; sts %s" % (
@@ -149,23 +174,27 @@ def show_nodes(rsd, nodes, level=0):
             len(node.links.local_drives),
             len(node.links.remote_drives),
             len(node.get_allowed_detach_endpoints()),
-            len(node.get_allowed_attach_endpoints()),
-            len(links['Endpoints']),
+            len_attach_endpoints,
+            len(links['Endpoints']) if links else 0,
             len(links_["ManagedBy"]),
-            len(links["ManagedBy"]),
+            len(links["ManagedBy"]) if links else 0,
             len(links_["Storage"])), end="")
-        print(" | %s %s ~%s %s %s, proc %s/%s/%s, "
-              "mem %sGiB, eth %s" % (
-                  system.identity,
-                  system.status.state,
-                  node.uuid.split("-")[-1],
-                  system.system_type,
-                  system.power_state,
-                  len(processors),
-                  sum(p.total_cores for p in processors),
-                  sum(p.total_threads for p in processors),
-                  system.memory_summary.size_gib,
-                  macs))
+
+        if system:
+            print(" | %s %s ~%s %s %s, proc %s/%s/%s, "
+                  "mem %sGiB, eth %s" % (
+                      system.identity,
+                      system.status.state,
+                      node.uuid.split("-")[-1],
+                      system.system_type,
+                      system.power_state,
+                      len(processors),
+                      sum(p.total_cores for p in processors),
+                      sum(p.total_threads for p in processors),
+                      system.memory_summary.size_gib,
+                      macs))
+        else:
+            print("")
     if not level:
         print()
 
@@ -702,6 +731,49 @@ def create_volume(rsd, size_in_gb):
         print("Cannot create volume in %dG" % size_in_gb)
     return volume
 
+def clone_volume(rsd, volume):
+    ret = None
+
+
+def get_volume_stats(rsd):
+    def _get_storages(rsd, filter_nvme=True):
+        ret = []
+        for storage in rsd.get_storage_service_collection().get_members():
+            if filter_nvme:
+                drives = storage.drives.get_members()
+                if drives and \
+                        any(map(lambda ident: 'nvme' in ident.durable_name,
+                                drives[0].identifiers)):
+                    ret.append(storage)
+            else:
+                ret.append(storage)
+        return ret
+
+    free_capacity_gb = 0
+    total_capacity_gb = 0
+    allocated_capacity_gb = 0
+    total_volumes = 0
+    ret = []
+    try:
+        storages = _get_storages(rsd)
+        for storage in storages:
+            for pool in storage.storage_pools.get_members():
+                total_capacity_gb += \
+                        float(pool.capacity.allocated_bytes or 0)/GIGABYTE
+                allocated_capacity_gb += \
+                        float(pool.capacity.consumed_bytes or 0)/GIGABYTE
+            total_volumes += len(storage.volumes.members_identities)
+    except Exception as e:
+        print(e)
+        return None
+
+    free_capacity_gb = total_capacity_gb - allocated_capacity_gb
+    print("vol stats: free %sG, allocated %sG, total %sG, %s volumes" % (
+          free_capacity_gb,
+          allocated_capacity_gb,
+          total_capacity_gb,
+          total_volumes))
+
 
 ### CHASSIS ###
 
@@ -1069,9 +1141,9 @@ def show_endpoints(rsd, endpoints, level=0):
         links_str = "; zones %s, ports %s" % (
                 len(endpoint.links.zones),
                 len(endpoint.links.ports))
-        ident_str = ",".join("%s=~%s" %
+        ident_str = ",".join("%s=%s" %
                 (ident.name_format,
-                 ident.name.split("-")[-1])
+                 ident.name)
                 for ident in endpoint.identifiers)
         if ident_str:
             ident_str = "; " + ident_str
@@ -1145,12 +1217,27 @@ def get_node_endpoint_nqns(rsd, node):
         raise RuntimeError("Cannot find NQN for node %s: %s"
                 % (node.path, e))
 
+NQN_PREFIX = 'nqn.2014-08.org.nvmexpress:uuid:'
 def attach_volume(rsd, node, volume):
+    def _get_nqn_endpoints(rsd, endpoint_urls):
+        ret = []
+        for endpoint_url in endpoint_urls:
+            endpoint_json = \
+                    json.loads(rsd._conn.get(endpoint_url).text)
+            for ident in endpoint_json["Identifiers"]:
+                if ident["DurableNameFormat"] == "NQN":
+                    nqn = ident["DurableName"]
+                    nqn = nqn.split(NQN_PREFIX)[-1]
+                    ret.append((nqn, endpoint_json))
+                    break
+        return ret
+
     if volume.path not in node.get_allowed_attach_endpoints():
         raise RuntimeError("Not allowed to attach volume")
     num_vol_endpoints = len(volume.links.endpoints)
     if (num_vol_endpoints != 0):
         raise RuntimeError("Volume already attached")
+    node.refresh()
     node.attach_endpoint(volume.path)
     print("attached volume to node: %s -> %s" %
             (volume.identity, node.identity))
@@ -1161,21 +1248,36 @@ def attach_volume(rsd, node, volume):
         raise RuntimeError("Attach volume error: endpoints %d -> %d"
                 % (num_vol_endpoints, num_vol_endpoints_after))
     target_nqns = get_volume_endpoint_nqns(rsd, volume)
+
+    v_endpoints = volume.links.endpoints
+    v_endpoints = _get_nqn_endpoints(rsd, v_endpoints)
+    if len(v_endpoints) != 1:
+	return "Attach volume error: %d target nqns" % len(v_endpoints)
+    target_nqn, v_endpoint = v_endpoints[0]
+    ip_transports = v_endpoint["IPTransportDetails"]
+    if len(ip_transports) != 1:
+	return "Attach volume error: %d target ips" % len(ip_transports)
+    ip_transport = ip_transports[0]
+    target_ip = ip_transport["IPv4Address"]["Address"]
+    target_port = ip_transport["Port"]
+
     if len(target_nqns) != 1:
         raise RuntimeError("Attach volume error: %d target nqns"
                 % len(target_nqns))
     initiator_nqns = get_node_endpoint_nqns(rsd, node)
-    if len(initiator_nqns) != 1:
+    if len(initiator_nqns) == 0:
         raise RuntimeError("Attach volume error: %d initiator nqns"
                 % len(initiator_nqns))
     print("attached nqn info: %s, %s" %
             (target_nqns[0], initiator_nqns[0]))
-    return target_nqns[0], initiator_nqns[0]
+    assert(target_nqn == target_nqns[0])
+    return target_nqns[0], initiator_nqns[0], target_ip, target_port
 
 def detach_volume(node, volume):
     if volume.path not in node.get_allowed_detach_endpoints():
         raise RuntimeError("Not allowed to detach volume")
     num_vol_endpoints = len(volume.links.endpoints)
+    node.refresh()
     node.detach_endpoint(volume.path)
     print("detached volume from node: %s -//-> %s" %
             (volume.identity, node.identity))
